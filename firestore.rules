@@ -1,0 +1,227 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LabBoard Firestore security rules
+//
+// Roles:   admin  – manage instruments, users, maintenance, everything
+//          member – start/finish own sessions, book, templates, report issues
+//          guest  – read-only (e.g. a lab-monitor account), may report issues
+// Approval: a user doc is created by the client on first sign-in. Its role and
+//           `approved` flag are only accepted if they match the allowlist entry
+//           for that email, or the email belongs to ALLOWED DOMAIN below.
+//           Anyone else is stored as a pending guest (approved == false) until
+//           an admin approves them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── EDIT THIS: email domain whose Google accounts are auto-approved as
+    //    members. Use a regex. To disable domain auto-approval, set it to
+    //    something that can never match, e.g. '^$'.
+    function allowedDomainRegex() {
+      return '.*@university[.]edu$';
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
+    function signedIn() { return request.auth != null; }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function instPath(id) { return /databases/$(database)/documents/instruments/$(id); }
+    function allowPath(email) { return /databases/$(database)/documents/allowlist/$(email); }
+
+    function hasProfile() { return signedIn() && exists(userPath(request.auth.uid)); }
+    function me() { return get(userPath(request.auth.uid)).data; }
+    function isApproved() { return hasProfile() && me().approved == true; }
+    function isMember() { return isApproved() && me().role in ['member', 'admin']; }
+    function isAdmin() { return isApproved() && me().role == 'admin'; }
+
+    // Restricted instruments need the instrument id in the user's trainedOn list.
+    function trainedFor(instrumentId) {
+      let inst = get(instPath(instrumentId)).data;
+      return inst.get('restricted', false) == false
+          || me().role == 'admin'
+          || instrumentId in me().get('trainedOn', []);
+    }
+    function inService(instrumentId) {
+      return get(instPath(instrumentId)).data.get('status', 'ok') != 'out_of_service';
+    }
+    function unchanged(field) {
+      return request.resource.data.get(field, null) == resource.data.get(field, null);
+    }
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // Role/approval a user is allowed to give themselves.
+    function validSelfAccess(d) {
+      let listed = exists(allowPath(myEmail()));
+      return (listed
+               && d.role == get(allowPath(myEmail())).data.role
+               && d.approved == true)
+          || (!listed
+               && request.auth.token.email_verified == true
+               && myEmail().matches(allowedDomainRegex())
+               && d.role == 'member'
+               && d.approved == true)
+          || (d.role == 'guest' && d.approved == false);
+    }
+
+    // ── users ────────────────────────────────────────────────────────────────
+    match /users/{uid} {
+      allow read: if (signedIn() && request.auth.uid == uid) || isApproved();
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.email == myEmail()
+        && request.resource.data.trainedOn == []
+        && validSelfAccess(request.resource.data);
+
+      allow update: if isAdmin()
+        // own profile cosmetics
+        || (signedIn() && request.auth.uid == uid
+            && onlyChanges(['name', 'photoURL', 'lastLoginAt', 'notify']))
+        // self-upgrade when an admin has since added you to the allowlist
+        || (signedIn() && request.auth.uid == uid
+            && onlyChanges(['role', 'approved', 'name', 'photoURL', 'lastLoginAt'])
+            && validSelfAccess(request.resource.data)
+            && request.resource.data.approved == true);
+
+      allow delete: if isAdmin();
+    }
+
+    // ── allowlist (doc id = lower-case email) ────────────────────────────────
+    match /allowlist/{email} {
+      allow read: if isAdmin() || (signedIn() && myEmail() == email);
+      allow write: if isAdmin()
+        && (request.resource == null || request.resource.data.role in ['admin', 'member', 'guest']);
+    }
+
+    // ── instruments ──────────────────────────────────────────────────────────
+    match /instruments/{id} {
+      allow read: if isApproved();
+      allow create, delete: if isAdmin();
+
+      allow update: if isAdmin()
+        // A member claims a free instrument for a session they just created
+        // in the same batch/transaction.
+        || (isMember()
+            && onlyChanges(['activeSession', 'freeSince'])
+            && resource.data.get('activeSession', null) == null
+            && resource.data.get('status', 'ok') != 'out_of_service'
+            && request.resource.data.activeSession.uid == request.auth.uid
+            && getAfter(/databases/$(database)/documents/sessions/$(request.resource.data.activeSession.sessionId)).data.userId == request.auth.uid
+            && getAfter(/databases/$(database)/documents/sessions/$(request.resource.data.activeSession.sessionId)).data.instrumentId == id)
+        // The session owner releases the instrument when finishing.
+        || (isMember()
+            && onlyChanges(['activeSession', 'freeSince'])
+            && resource.data.get('activeSession', null) != null
+            && resource.data.activeSession.uid == request.auth.uid
+            && request.resource.data.activeSession == null);
+    }
+
+    // ── sessions ─────────────────────────────────────────────────────────────
+    match /sessions/{id} {
+      allow read: if isApproved();
+
+      allow create: if isMember()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'active'
+        && request.resource.data.expectedEnd is timestamp
+        && request.resource.data.expectedEnd > request.time
+        && request.resource.data.sample is string
+        && request.resource.data.sample.size() <= 200
+        && request.resource.data.params is list
+        && request.resource.data.params.size() <= 40
+        && trainedFor(request.resource.data.instrumentId)
+        && inService(request.resource.data.instrumentId);
+
+      // Only the session owner edits their session (admins may force-finish).
+      allow update: if (isMember()
+            && resource.data.userId == request.auth.uid
+            && unchanged('userId') && unchanged('instrumentId') && unchanged('startedAt')
+            && request.resource.data.status in ['active', 'finished'])
+        || isAdmin();
+
+      allow delete: if isAdmin();
+    }
+
+    // ── bookings ─────────────────────────────────────────────────────────────
+    function validBookingTimes(d) {
+      let maxH = get(instPath(d.instrumentId)).data.get('maxBookingHours', 12);
+      return d.start is timestamp && d.end is timestamp
+          && d.end > d.start
+          && d.end <= d.start + duration.value(maxH, 'h');
+    }
+
+    match /bookings/{id} {
+      allow read: if isApproved();
+
+      allow create: if isMember()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'booked'
+        && request.resource.data.end > request.time
+        && validBookingTimes(request.resource.data)
+        && trainedFor(request.resource.data.instrumentId)
+        && inService(request.resource.data.instrumentId);
+
+      allow update: if
+        // Owner cancels or marks the booking as started
+        (isMember()
+          && resource.data.userId == request.auth.uid
+          && request.resource.data.status in ['started', 'cancelled']
+          && onlyChanges(['status', 'sessionId', 'startedAt', 'cancelledAt']))
+        // Owner moves / resizes their booking
+        || (isMember()
+          && resource.data.userId == request.auth.uid
+          && resource.data.status == 'booked'
+          && request.resource.data.status == 'booked'
+          && onlyChanges(['start', 'end', 'purpose'])
+          && request.resource.data.end > request.time
+          && validBookingTimes(request.resource.data))
+        // Any approved user may auto-release a no-show 30 minutes after start
+        || (isApproved()
+          && resource.data.status == 'booked'
+          && request.time > resource.data.start + duration.value(30, 'm')
+          && request.resource.data.status == 'released'
+          && onlyChanges(['status', 'releasedAt']))
+        || isAdmin();
+
+      allow delete: if isAdmin() || (isMember() && resource.data.userId == request.auth.uid);
+    }
+
+    // ── templates (saved parameter sets per instrument) ──────────────────────
+    match /templates/{id} {
+      allow read: if isApproved();
+      allow create: if isMember()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.params is list
+        && request.resource.data.params.size() <= 40;
+      allow update, delete: if isAdmin()
+        || (isMember() && resource.data.createdBy == request.auth.uid && unchanged('createdBy'));
+    }
+
+    // ── issues ───────────────────────────────────────────────────────────────
+    match /issues/{id} {
+      allow read: if isApproved();
+      allow create: if isApproved()
+        && request.resource.data.reportedBy == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 2000;
+      allow update, delete: if isAdmin();
+    }
+
+    // ── maintenance & calibration ────────────────────────────────────────────
+    match /maintenance/{id} {
+      allow read: if isApproved();
+      allow write: if isAdmin();
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
